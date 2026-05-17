@@ -1,1 +1,1 @@
-web: gunicorn "tradeeasy_bot:app"
+web: gunicorn app:app
