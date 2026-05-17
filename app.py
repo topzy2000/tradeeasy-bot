@@ -252,39 +252,67 @@ def parse_trader_message(text):
     if text in ["help", "commands", "options"]:
         return {"action": "help"}
 
-    # Parse SALE: "sold 5000", "sale 5000", "sold tomatoes 5000"
+    # Parse SALE: handles typed and voice variations
+    # "sold onion 5000", "sold 5000", "I sold onion for five thousand"
+    # "sale onion 5000", "onion 5000 sale", "5000 for onion"
     sale_patterns = [
-        r"^(?:sold?|sale|income|received?|got)\s+(?:(\w+)\s+)?([\d,]+)",
+        r"^(?:sold?|sale|income|received?|got|collect(?:ed)?)\s+(?:(\w+)\s+)?([\d,]+)",
         r"^([\d,]+)\s+(?:sale|sold|income)",
+        r"^(?:sold?|sale)\s+([\d,]+)",           # "sold 5000" no item
+        r"(\w+)\s+([\d,]+)\s+(?:sale|sold)",     # "onion 5000 sold"
     ]
     for p in sale_patterns:
         m = re.search(p, text)
         if m:
-            groups = m.groups()
+            groups = [g for g in m.groups() if g is not None]
             if len(groups) == 2:
-                item   = groups[0] or "Sale"
-                amount = float(groups[1].replace(",", ""))
+                # figure out which is item and which is amount
+                g0, g1 = groups
+                if re.match(r"^\d+$", g0) and not re.match(r"^\d+$", g1):
+                    item, amount_str = g1, g0
+                elif re.match(r"^\d+$", g1):
+                    item, amount_str = g0, g1
+                else:
+                    item, amount_str = "Sale", g0
+            elif len(groups) == 1:
+                item, amount_str = "Sale", groups[0]
             else:
-                item   = "Sale"
-                amount = float(groups[0].replace(",", ""))
-            return {"action": "sale", "amount": amount, "item": item.title()}
+                continue
+            try:
+                amount = float(amount_str.replace(",", ""))
+                return {"action": "sale", "amount": amount, "item": item.title()}
+            except:
+                continue
 
-    # Parse EXPENSE: "expense 3000", "bought rice 5000", "spent 2000"
+    # Parse EXPENSE: handles typed and voice variations
+    # "expense transport 500", "bought rice 5000", "spent 2000 on transport"
     expense_patterns = [
-        r"^(?:expense|exp|spent?|bought?|paid?|cost)\s+(?:(\w+)\s+)?([\d,]+)",
+        r"^(?:expense|exp|spent?|bought?|paid?|cost|buy)\s+(?:(\w+)\s+)?([\d,]+)",
         r"^([\d,]+)\s+(?:expense|spent|cost)",
+        r"^(?:expense|exp)\s+([\d,]+)",           # "expense 2000" no item
+        r"spent?\s+([\d,]+)\s+(?:on\s+)?(\w+)",  # "spent 2000 on transport"
     ]
     for p in expense_patterns:
         m = re.search(p, text)
         if m:
-            groups = m.groups()
+            groups = [g for g in m.groups() if g is not None]
             if len(groups) == 2:
-                item   = groups[0] or "Expense"
-                amount = float(groups[1].replace(",", ""))
+                g0, g1 = groups
+                if re.match(r"^\d+$", g0):
+                    item, amount_str = g1, g0
+                elif re.match(r"^\d+$", g1):
+                    item, amount_str = g0, g1
+                else:
+                    item, amount_str = "Expense", g0
+            elif len(groups) == 1:
+                item, amount_str = "Expense", groups[0]
             else:
-                item   = "Expense"
-                amount = float(groups[0].replace(",", ""))
-            return {"action": "expense", "amount": amount, "item": item.title()}
+                continue
+            try:
+                amount = float(amount_str.replace(",", ""))
+                return {"action": "expense", "amount": amount, "item": item.title()}
+            except:
+                continue
 
     # Parse DEBT: "debt mama chioma 12000"
     debt_match = re.search(r"^(?:debt|owe|owes?)\s+(.+?)\s+([\d,]+)", text)
@@ -295,6 +323,26 @@ def parse_trader_message(text):
             "amount": float(debt_match.group(2).replace(",", ""))
         }
 
+    # Parse UNDO LAST: "undo", "cancel", "remove last"
+    if text in ["undo", "cancel", "remove last", "delete last", "mistake"]:
+        return {"action": "undo"}
+
+    # Parse REMOVE SALE: "remove sale 5000", "delete sale 3000", "cancel sale 5000"
+    remove_sale_match = re.search(r"^(?:remove|delete|cancel)\s+sale\s+([\d,]+)", text)
+    if remove_sale_match:
+        return {
+            "action": "remove_sale",
+            "amount": float(remove_sale_match.group(1).replace(",", ""))
+        }
+
+    # Parse REMOVE EXPENSE: "remove expense 2000", "delete expense 500"
+    remove_exp_match = re.search(r"^(?:remove|delete|cancel)\s+(?:expense|exp)\s+([\d,]+)", text)
+    if remove_exp_match:
+        return {
+            "action": "remove_expense",
+            "amount": float(remove_exp_match.group(1).replace(",", ""))
+        }
+
     return {"action": "unknown", "raw": text}
 
 
@@ -302,14 +350,53 @@ def parse_trader_message(text):
 # VOICE TRANSCRIPTION
 # ══════════════════════════════════════════════
 
+def undo_last_transaction(phone):
+    """Remove the most recent transaction for a trader"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    ref = db.reference(f"transactions/{clean_phone(phone)}")
+    all_txns = ref.get() or {}
+
+    # Find today's transactions sorted by time
+    todays = [(k, v) for k, v in all_txns.items() if v.get("date") == today]
+    if not todays:
+        return None
+
+    # Sort by time descending, get most recent
+    todays.sort(key=lambda x: x[1].get("time", ""), reverse=True)
+    last_key, last_txn = todays[0]
+
+    # Delete it
+    ref.child(last_key).delete()
+    return last_txn
+
+def remove_transaction_by_amount(phone, txn_type, amount):
+    """Remove the most recent transaction matching type and amount"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    ref = db.reference(f"transactions/{clean_phone(phone)}")
+    all_txns = ref.get() or {}
+
+    # Find matching transactions today
+    matches = [
+        (k, v) for k, v in all_txns.items()
+        if v.get("date") == today
+        and v.get("type") == txn_type
+        and abs(v.get("amount", 0) - amount) < 1
+    ]
+    if not matches:
+        return None
+
+    # Delete the most recent match
+    matches.sort(key=lambda x: x[1].get("time", ""), reverse=True)
+    key, txn = matches[0]
+    ref.child(key).delete()
+    return txn
+
+
 def transcribe_voice(media_url):
     """Transcribe a WhatsApp voice note using OpenAI Whisper"""
     try:
-        # Download voice file from Twilio
         auth = (TWILIO_SID, TWILIO_TOKEN)
         audio_response = requests.get(media_url, auth=auth)
-
-        # Send to OpenAI Whisper
         headers = {"Authorization": f"Bearer {OPENAI_KEY}"}
         files   = {"file": ("audio.ogg", audio_response.content, "audio/ogg")}
         data    = {"model": "whisper-1", "language": "en"}
@@ -318,10 +405,81 @@ def transcribe_voice(media_url):
             headers=headers, files=files, data=data
         )
         result = response.json()
-        return result.get("text", "")
+        raw = result.get("text", "")
+        print(f"[WHISPER RAW]: {raw}")   # logs what Whisper heard — check Render logs
+        return normalize_voice_text(raw)
     except Exception as e:
         print(f"Voice transcription error: {e}")
         return ""
+
+
+def normalize_voice_text(text):
+    """
+    Clean up Whisper transcription so the parser can understand it.
+    Handles: word numbers, filler words, punctuation, Nigerian speech patterns.
+    """
+    if not text:
+        return ""
+
+    t = text.lower().strip()
+
+    # ── Remove punctuation ──
+    t = re.sub(r"[.,!?;:]", " ", t)
+
+    # ── Remove common filler/prefix words ──
+    # e.g. "I sold", "so I sold", "please record", "um sold", "okay sold"
+    fillers = [
+        r"^(so\s+)?(i\s+)?",
+        r"^(please\s+)?(record\s+)?",
+        r"^(um+\s+)?(uh+\s+)?",
+        r"^(okay\s+)?(ok\s+)?",
+        r"^(just\s+)?",
+    ]
+    for f in fillers:
+        t = re.sub(f, "", t).strip()
+
+    # ── Convert word numbers to digits ──
+    word_numbers = {
+        "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+        "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+        "ten": "10", "eleven": "11", "twelve": "12", "thirteen": "13",
+        "fourteen": "14", "fifteen": "15", "sixteen": "16", "seventeen": "17",
+        "eighteen": "18", "nineteen": "19", "twenty": "20", "thirty": "30",
+        "forty": "40", "fifty": "50", "sixty": "60", "seventy": "70",
+        "eighty": "80", "ninety": "90", "hundred": "100",
+        # Nigerian common amounts
+        "thousand": "000", "k": "000",
+        "five thousand": "5000", "ten thousand": "10000",
+        "twenty thousand": "20000", "fifty thousand": "50000",
+        "hundred thousand": "100000", "one thousand": "1000",
+        "two thousand": "2000", "three thousand": "3000",
+        "four thousand": "4000", "six thousand": "6000",
+        "seven thousand": "7000", "eight thousand": "8000",
+        "nine thousand": "9000", "fifteen thousand": "15000",
+    }
+    # Replace multi-word numbers first (longest first)
+    for word, digit in sorted(word_numbers.items(), key=lambda x: -len(x[0])):
+        t = re.sub(r"\b" + word + r"\b", digit, t)
+
+    # ── Fix "5 000" → "5000" (Whisper sometimes adds space in numbers) ──
+    t = re.sub(r"(\d+)\s+000", r"\g<1>000", t)
+
+    # ── Remove commas in numbers: "5,000" → "5000" ──
+    t = re.sub(r"(\d),(\d)", r"\1\2", t)
+
+    # ── Normalize Nigerian speech patterns ──
+    # "na" = "is/it's" in Pidgin, often said before amounts
+    t = re.sub(r"\bna\b", "", t)
+    # "for" before amount e.g. "sold onion for 5000"
+    t = re.sub(r"\bfor\b\s+(\d)", r"\1", t)
+    # "naira" after amount e.g. "5000 naira"
+    t = re.sub(r"(\d+)\s+naira", r"\1", t)
+
+    # ── Clean up extra spaces ──
+    t = re.sub(r"\s+", " ", t).strip()
+
+    print(f"[NORMALIZED]: {t}")   # check Render logs
+    return t
 
 
 # ══════════════════════════════════════════════
@@ -335,8 +493,11 @@ def build_response(action_result, summary):
     if action == "sale":
         amount = action_result["amount"]
         item   = action_result.get("item", "Sale")
+        heard  = action_result.get("heard", "")
+        heard_line = f"🎤 _Heard: \"{heard}\"_\n\n" if heard else ""
         return (
             f"✅ *Sale recorded!*\n\n"
+            f"{heard_line}"
             f"📦 {item}: {format_naira(amount)}\n"
             f"🕐 {datetime.now().strftime('%I:%M %p')}\n\n"
             f"*Today so far:*\n"
@@ -349,8 +510,11 @@ def build_response(action_result, summary):
     elif action == "expense":
         amount = action_result["amount"]
         item   = action_result.get("item", "Expense")
+        heard  = action_result.get("heard", "")
+        heard_line = f"🎤 _Heard: \"{heard}\"_\n\n" if heard else ""
         return (
             f"✅ *Expense recorded!*\n\n"
+            f"{heard_line}"
             f"🛒 {item}: {format_naira(amount)}\n"
             f"🕐 {datetime.now().strftime('%I:%M %p')}\n\n"
             f"*Updated profit: {format_naira(summary['profit'])}* 📊"
@@ -397,6 +561,10 @@ def build_response(action_result, summary):
             "🛒 *Log an Expense:*\n"
             "`expense 2000`\n"
             "`bought rice 5000`\n\n"
+            "❌ *Remove a Mistake:*\n"
+            "`undo` — removes last entry\n"
+            "`remove sale 5000` — removes that sale\n"
+            "`remove expense 2000` — removes that expense\n\n"
             "📊 *Check Today:*\n"
             "`profit` or `summary`\n\n"
             "📅 *Weekly Report:*\n"
@@ -460,7 +628,12 @@ def webhook():
         if transcribed:
             body = transcribed
         else:
-            msg.body("Sorry, I couldn't hear that. Please try again or type your sale.")
+            msg.body(
+                "❌ Sorry, I couldn't hear that clearly.\n\n"
+                "Try again or type it:\n"
+                "`sold onion 5000`\n"
+                "`expense transport 500`"
+            )
             return str(resp)
 
     # ── Check if this is a POS/Transfer SMS ──
@@ -474,6 +647,9 @@ def webhook():
 
     # ── Parse normal message ──
     parsed = parse_trader_message(body)
+    # If from voice, attach what was heard for display
+    if num_media > 0 and "audio" in media_type:
+        parsed["heard"] = body
     action = parsed.get("action")
 
     if action == "sale":
@@ -486,6 +662,50 @@ def webhook():
             "amount": parsed["amount"],
             "date":   datetime.now().isoformat()
         })
+    elif action == "undo":
+        removed = undo_last_transaction(phone)
+        if removed:
+            summary = get_today_summary(phone)
+            txn_type = "Sale" if removed["type"] == "sale" else "Expense"
+            msg.body(
+                f"↩️ *Last entry removed!*\n\n"
+                f"{txn_type}: {format_naira(removed['amount'])} ({removed.get('item','')})\n"
+                f"has been deleted.\n\n"
+                f"*Updated profit: {format_naira(summary['profit'])}*"
+            )
+        else:
+            msg.body("❌ No transactions found today to remove.")
+        return str(resp)
+    elif action == "remove_sale":
+        removed = remove_transaction_by_amount(phone, "sale", parsed["amount"])
+        if removed:
+            summary = get_today_summary(phone)
+            msg.body(
+                f"↩️ *Sale removed!*\n\n"
+                f"Sale of {format_naira(parsed['amount'])} deleted.\n\n"
+                f"*Updated profit: {format_naira(summary['profit'])}*"
+            )
+        else:
+            msg.body(
+                f"❌ Could not find a sale of {format_naira(parsed['amount'])} today.\n\n"
+                f"Try `undo` to remove the last entry instead."
+            )
+        return str(resp)
+    elif action == "remove_expense":
+        removed = remove_transaction_by_amount(phone, "expense", parsed["amount"])
+        if removed:
+            summary = get_today_summary(phone)
+            msg.body(
+                f"↩️ *Expense removed!*\n\n"
+                f"Expense of {format_naira(parsed['amount'])} deleted.\n\n"
+                f"*Updated profit: {format_naira(summary['profit'])}*"
+            )
+        else:
+            msg.body(
+                f"❌ Could not find an expense of {format_naira(parsed['amount'])} today.\n\n"
+                f"Try `undo` to remove the last entry instead."
+            )
+        return str(resp)
 
     summary = get_today_summary(phone)
     msg.body(build_response(parsed, summary))
